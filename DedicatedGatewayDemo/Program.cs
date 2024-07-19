@@ -1,5 +1,6 @@
 ﻿using Microsoft.Azure.Cosmos;
 using System;
+using System.Collections.Generic;
 using System.Configuration;
 using System.Threading;
 using System.Threading.Tasks;
@@ -24,7 +25,8 @@ namespace DedicatedGatewayDemo
             };
             CosmosClient client = new CosmosClient(CosmosDBConnection, options);
 
-            var container = await client.GetDatabase(DatabaseName).CreateContainerIfNotExistsAsync(ContainerName, PartitionKeyPath);
+            var db = await client.CreateDatabaseIfNotExistsAsync(DatabaseName);
+            var container = await db.Database.CreateContainerIfNotExistsAsync(ContainerName, PartitionKeyPath);
 
             var docId = Guid.NewGuid().ToString();
 
@@ -35,9 +37,25 @@ namespace DedicatedGatewayDemo
             await TestItemCache(container, docId);
 
             Console.WriteLine("\nTest query cache: ");
-            await TestQueryCache(container);
-            await TestQueryCache(container);
+            await TestQueryCache(container, false);
+            await TestQueryCache(container, false);
 
+            Console.WriteLine("\nTest bypassing query cache: ");
+            await TestQueryCache(container, true);
+
+            Console.WriteLine("\nTest ReadMany: ");
+            IList<string> docIds = new List<string>() { Guid.NewGuid().ToString(), Guid.NewGuid().ToString() };
+            await TestReadMany(container, docIds, true);
+            await TestReadMany(container, docIds, false);
+            docIds.Add(docId);
+            await TestReadMany(container, docIds, false);
+            await TestReadMany(container, docIds, false);
+
+            Console.WriteLine("\nTest Update then ReadMany: ");
+            await UpdateItem(container, docId);
+            await TestReadMany(container, docIds, false);
+            await TestReadMany(container, docIds, false);
+            
             Console.WriteLine("\nTest cache staleness: ");
             await TestCacheStaleness(container, docId);
         }
@@ -46,18 +64,29 @@ namespace DedicatedGatewayDemo
         {
             var requestOptions = new ItemRequestOptions()
             {
-                ConsistencyLevel = ConsistencyLevel.Session
+                ConsistencyLevel = ConsistencyLevel.Session,
+                DedicatedGatewayRequestOptions = new DedicatedGatewayRequestOptions()
+                {
+                    BypassIntegratedCache = false
+                }
             };
 
             var response = await container.CreateItemAsync(new { id = docId }, new PartitionKey(docId), requestOptions);
-            Console.WriteLine($"Write item request charge for document id {docId}:\t{response.RequestCharge:0.00} RU/s");
+            Console.WriteLine($"Write item request charge for document id {docId}:\t{response.RequestCharge:0.00} RU/s\n");
+        }
+
+        public static async Task UpdateItem(Container container, string docId)
+        {
+            var response = await container.ReplaceItemAsync(new { id = docId, update = true }, docId);
+            Console.WriteLine($"Update item request charge for document id {docId}:\t{response.RequestCharge:0.00} RU/s");
+            Console.WriteLine($"Updated item:\t{response.Resource}\n");
         }
 
         public static async Task TestItemCache(Container container, string docId)
         {
             var requestOptions = new ItemRequestOptions() 
             { 
-                ConsistencyLevel = ConsistencyLevel.Eventual
+                ConsistencyLevel = ConsistencyLevel.Session
             };
 
             ItemResponse<dynamic> response = await container.ReadItemAsync<dynamic>(docId, new PartitionKey(docId), requestOptions);
@@ -67,14 +96,18 @@ namespace DedicatedGatewayDemo
             Console.WriteLine($"Point read 2 request charge for document id {docId}:\t{response2.RequestCharge:0.00} RU/s\n");
         }
 
-        public static async Task TestQueryCache(Container container)
+        public static async Task TestQueryCache(Container container, bool bypassCache)
         {            
             string sqlText = "SELECT * FROM c";
             QueryDefinition query = new QueryDefinition(sqlText);
 
             QueryRequestOptions queryOptions = new QueryRequestOptions()
             {
-                ConsistencyLevel = ConsistencyLevel.Eventual
+                ConsistencyLevel = ConsistencyLevel.Eventual,
+                DedicatedGatewayRequestOptions = new DedicatedGatewayRequestOptions()
+                {
+                    BypassIntegratedCache = bypassCache
+                }
             };
             FeedIterator<dynamic> iterator = container.GetItemQueryIterator<dynamic>(query, requestOptions: queryOptions);
 
@@ -87,6 +120,29 @@ namespace DedicatedGatewayDemo
             }
 
             Console.WriteLine($"Total query request charge:\t{totalRequestCharge:0.00} RU/s\n");
+        }
+
+        public static async Task TestReadMany(Container container, IList<string> docIds, bool createDocs)
+        {
+            IList<(string, PartitionKey)> itemList = new List<(string, PartitionKey)>();
+            foreach(var id in docIds)
+            {
+                if (createDocs)
+                {
+                    var response1 = await container.CreateItemAsync(new { id = id }, new PartitionKey(id));
+                    Console.WriteLine($"Write item request charge for document id {id}:\t{response1.RequestCharge:0.00} RU/s");
+                }
+
+                itemList.Add((id, new PartitionKey(id)));
+            }
+
+            FeedResponse<dynamic> feedResponse = await container.ReadManyItemsAsync<dynamic>(itemList.AsReadOnly());
+            Console.WriteLine($"Read many request charge:\t{feedResponse.RequestCharge:0.00} RU/s");
+            foreach(var item in feedResponse.Resource)
+            {
+                Console.WriteLine("Read many item: " + item);
+            }
+            Console.WriteLine();
         }
 
         public static async Task TestCacheStaleness(Container container, string docId)
